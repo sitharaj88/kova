@@ -179,6 +179,17 @@ published artifacts and delete that line from `settings.gradle.kts`.
 5. **Nullable flow values are rejected at codegen time** (Objective-C generics can't represent
    them) — model absence inside the state class instead.
 
+## Publishing (maintainers)
+
+On macOS, [scripts/publish.sh](scripts/publish.sh) handles the whole flow with credentials
+stored in the Keychain (never on disk):
+
+```bash
+./scripts/publish.sh setup     # one-time: Central Portal token + GPG key → Keychain
+./scripts/publish.sh local     # dry run to ~/.m2
+./scripts/publish.sh           # signed publish to Maven Central
+```
+
 ## Requirements
 
 - Kotlin 2.2.21+, KSP 2.2.21-2.0.5, Gradle 8.14+, AGP 8.9+

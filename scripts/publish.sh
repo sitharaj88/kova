@@ -1,25 +1,30 @@
 #!/usr/bin/env bash
 #
-# Kova publishing script (macOS).
+# Maven Central publishing script (macOS) — project-agnostic.
 #
 # Stores Maven Central credentials and the GPG signing key in the macOS Keychain
 # (encrypted, per-user) and feeds them to Gradle as ORG_GRADLE_PROJECT_* environment
 # variables at publish time. Secrets never touch gradle.properties or the repo.
 #
+# Credentials are shared across all projects on this machine — set up once, then drop
+# this script into any Gradle project that uses the vanniktech maven-publish plugin
+# (or any build reading mavenCentralUsername / signingInMemoryKey properties) and has
+# VERSION_NAME in its gradle.properties.
+#
 # Usage:
-#   ./scripts/publish.sh setup      # interactive one-time credential setup
-#   ./scripts/publish.sh            # publish to Maven Central (runs setup if needed)
+#   ./scripts/publish.sh setup      # interactive one-time credential setup (per machine)
+#   ./scripts/publish.sh            # publish this project to Maven Central
 #   ./scripts/publish.sh local      # dry run: publish to ~/.m2 (no credentials needed)
 #   ./scripts/publish.sh status     # show which credentials are stored
-#   ./scripts/publish.sh reset      # remove all stored credentials from the Keychain
+#   ./scripts/publish.sh reset      # remove stored credentials from the Keychain
 #
 set -euo pipefail
 
-ACCOUNT="kova-publish"
-ITEM_USER="kova.mavenCentralUsername"
-ITEM_PASS="kova.mavenCentralPassword"
-ITEM_KEY="kova.signingKeyBase64"
-ITEM_KEYPASS="kova.signingKeyPassword"
+ACCOUNT="maven-central-publish"
+ITEM_USER="maven-central.username"
+ITEM_PASS="maven-central.password"
+ITEM_KEY="maven-central.signingKeyBase64"
+ITEM_KEYPASS="maven-central.signingKeyPassword"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -36,6 +41,32 @@ keychain_set() { security add-generic-password -U -a "$ACCOUNT" -s "$1" -w "$2";
 keychain_del() { security delete-generic-password -a "$ACCOUNT" -s "$1" >/dev/null 2>&1 || true; }
 keychain_has() { security find-generic-password -a "$ACCOUNT" -s "$1" >/dev/null 2>&1; }
 
+# One-time migration from the original kova-specific Keychain names.
+migrate_legacy() {
+  local pairs=(
+    "kova.mavenCentralUsername:$ITEM_USER"
+    "kova.mavenCentralPassword:$ITEM_PASS"
+    "kova.signingKeyBase64:$ITEM_KEY"
+    "kova.signingKeyPassword:$ITEM_KEYPASS"
+  )
+  for pair in "${pairs[@]}"; do
+    local old="${pair%%:*}" new="${pair##*:}"
+    if ! keychain_has "$new" \
+        && security find-generic-password -a "kova-publish" -s "$old" >/dev/null 2>&1; then
+      keychain_set "$new" "$(security find-generic-password -a "kova-publish" -s "$old" -w)"
+      security delete-generic-password -a "kova-publish" -s "$old" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+gradle_prop() { grep "^$1=" "$ROOT/gradle.properties" | head -1 | cut -d= -f2-; }
+
+project_name() {
+  local name
+  name="$(gradle_prop POM_NAME)"
+  [[ -n "$name" ]] && echo "$name" || basename "$ROOT"
+}
+
 find_java_home() {
   local jbr="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
   if [[ -x "$jbr/bin/java" ]]; then
@@ -49,11 +80,12 @@ find_java_home() {
 }
 
 setup() {
-  bold "Kova publishing setup — credentials go to your macOS Keychain."
+  bold "Maven Central publishing setup — credentials go to your macOS Keychain."
+  bold "This is per-machine, shared by every project that uses this script."
   echo
   echo "You need a Central Portal user token (central.sonatype.com → account → Generate User Token)"
   echo "and a GPG signing key exported with:"
-  echo "  gpg --export-secret-keys --armor <KEY_ID> > kova-signing.asc"
+  echo "  gpg --export-secret-keys --armor <KEY_ID> > ~/signing-key.asc"
   echo
 
   read -r -p "Maven Central token username: " mc_user
@@ -62,7 +94,7 @@ setup() {
   read -r -s -p "Maven Central token password: " mc_pass; echo
   [[ -n "$mc_pass" ]] || { red "Password must not be empty."; exit 1; }
 
-  read -r -p "Path to armored GPG secret key file (e.g. ~/kova-signing.asc): " key_path
+  read -r -p "Path to armored GPG secret key file (e.g. ~/signing-key.asc): " key_path
   key_path="${key_path/#\~/$HOME}"
   [[ -f "$key_path" ]] || { red "File not found: $key_path"; exit 1; }
   grep -q "BEGIN PGP PRIVATE KEY BLOCK" "$key_path" \
@@ -81,6 +113,7 @@ setup() {
 }
 
 status() {
+  migrate_legacy
   for item in "$ITEM_USER" "$ITEM_PASS" "$ITEM_KEY" "$ITEM_KEYPASS"; do
     if keychain_has "$item"; then green "  ✓ $item"; else red "  ✗ $item (missing)"; fi
   done
@@ -88,17 +121,20 @@ status() {
 
 reset() {
   for item in "$ITEM_USER" "$ITEM_PASS" "$ITEM_KEY" "$ITEM_KEYPASS"; do keychain_del "$item"; done
-  green "All Kova publishing credentials removed from the Keychain."
+  green "Maven Central publishing credentials removed from the Keychain."
 }
 
 publish_local() {
   export JAVA_HOME="$(find_java_home)"
   bold "Publishing to ~/.m2 (mavenLocal) — no signing, no credentials."
   "$ROOT/gradlew" -p "$ROOT" publishToMavenLocal
-  green "Done. Artifacts in ~/.m2/repository/in/sitharaj/kova/"
+  local group_path
+  group_path="$(gradle_prop GROUP | tr . /)"
+  green "Done. Artifacts in ~/.m2/repository/${group_path:-<group>}/"
 }
 
 publish_central() {
+  migrate_legacy
   keychain_has "$ITEM_USER" && keychain_has "$ITEM_PASS" && keychain_has "$ITEM_KEY" || {
     bold "No stored credentials found — running setup first."
     echo
@@ -112,9 +148,12 @@ publish_central() {
   export ORG_GRADLE_PROJECT_signingInMemoryKey="$(keychain_get "$ITEM_KEY" | base64 -d)"
   export ORG_GRADLE_PROJECT_signingInMemoryKeyPassword="$(keychain_get "$ITEM_KEYPASS")"
 
-  local version
-  version="$(grep '^VERSION_NAME=' "$ROOT/gradle.properties" | cut -d= -f2)"
-  bold "About to publish Kova $version to Maven Central as $(keychain_get "$ITEM_USER")."
+  local version name
+  version="$(gradle_prop VERSION_NAME)"
+  [[ -n "$version" ]] || { red "VERSION_NAME not found in $ROOT/gradle.properties."; exit 1; }
+  name="$(project_name)"
+
+  bold "About to publish $name $version to Maven Central as $(keychain_get "$ITEM_USER")."
   red  "Maven Central releases are permanent — they cannot be unpublished."
   read -r -p "Type the version ($version) to confirm: " confirm
   [[ "$confirm" == "$version" ]] || { red "Aborted."; exit 1; }
